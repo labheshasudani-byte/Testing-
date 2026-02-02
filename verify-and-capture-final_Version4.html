@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Verification</title>
+  <style>
+    body { font-family: Arial, sans-serif; text-align:center; padding:20px; background:#f7f8fc; color:#111; }
+    .card { max-width:520px; margin:18px auto; background:#fff; padding:16px; border-radius:10px; box-shadow:0 6px 20px rgba(0,0,0,0.06); }
+    h2 { margin-top:0; }
+    .muted { color:#666; font-size:14px; }
+    .danger { color:#a33; }
+    label { display:block; margin:12px 0 6px; text-align:left; font-weight:600; }
+    input[type="checkbox"] { transform:scale(1.05); margin-right:8px; }
+    button { padding:10px 14px; border-radius:8px; border:0; cursor:pointer; background:#2b66ff; color:white; font-size:15px; }
+    button.secondary { background:#fff; color:#111; border:1px solid #dfe6ff; }
+    video, canvas { border-radius:8px; margin-top:12px; max-width:100%; }
+  </style>
+</head>
+<body>
+  <div class="card" role="main" aria-labelledby="title">
+    <h2 id="title">Verification</h2>
+
+    <p class="muted">Verification ke liye aapki <strong>location</strong> aur <strong>photo</strong> li jayegi.</p>
+
+    <label style="text-align:left">
+      <input id="consent" type="checkbox">
+      I consent to share my current location and photo for verification. (Will be deleted after 48 hours.)
+    </label>
+
+    <button id="startBtn" disabled>YES – Verify Now</button>
+    <p id="status" class="muted" aria-live="polite"></p>
+
+    <div id="camArea" style="display:none">
+      <video id="video" width="320" autoplay playsinline></video><br>
+      <button id="capBtn" class="secondary">Capture Photo</button>
+    </div>
+
+    <canvas id="canvas" width="640" height="480" style="display:none"></canvas>
+  </div>
+
+<script>
+(() => {
+  // CONFIG: change SEND_URL to your server endpoint (must be HTTPS in production)
+  const SEND_URL = 'send.php'; // or full URL like 'https://yourdomain.com/send.php'
+  const API_KEY = ''; // optional: set if server requires X-API-KEY (not recommended to embed in public clients)
+
+  // DOM
+  const consent = document.getElementById('consent');
+  const startBtn = document.getElementById('startBtn');
+  const statusEl = document.getElementById('status');
+  const camArea = document.getElementById('camArea');
+  const video = document.getElementById('video');
+  const capBtn = document.getElementById('capBtn');
+  const canvas = document.getElementById('canvas');
+
+  let mediaStream = null;
+  let lastCoords = null;
+
+  // Enable start only when consent checked
+  consent.addEventListener('change', () => startBtn.disabled = !consent.checked);
+
+  function setStatus(msg, isError = false) {
+    statusEl.textContent = msg || '';
+    statusEl.className = isError ? 'danger' : 'muted';
+  }
+
+  // HTTPS check (geolocation & camera require secure context except on localhost)
+  if (location.protocol !== 'https:' && location.hostname !== 'localhost') {
+    setStatus('Warning: For camera & location permissions, serve this page over HTTPS.', true);
+  }
+
+  startBtn.addEventListener('click', () => {
+    setStatus('');
+    startBtn.disabled = true;
+
+    if (!('geolocation' in navigator)) {
+      setStatus('Geolocation not available in this browser.', true);
+      startBtn.disabled = false;
+      return;
+    }
+
+    setStatus('Requesting location permission...');
+    navigator.geolocation.getCurrentPosition(
+      pos => {
+        lastCoords = {
+          latitude: pos.coords.latitude,
+          longitude: pos.coords.longitude,
+          accuracy: pos.coords.accuracy,
+          timestamp: new Date(pos.timestamp).toISOString()
+        };
+        setStatus('Location verified. Allow camera access to capture photo.');
+        startCamera();
+      },
+      err => {
+        setStatus('Location denied or unavailable: ' + (err.message || err.code), true);
+        startBtn.disabled = false;
+      },
+      { enableHighAccuracy: false, timeout: 20000 }
+    );
+  });
+
+  async function startCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Camera API not supported.', true);
+      startBtn.disabled = false;
+      return;
+    }
+    try {
+      mediaStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" }, audio: false });
+      video.srcObject = mediaStream;
+      camArea.style.display = 'block';
+      canvas.style.display = 'none';
+      setStatus('');
+    } catch (err) {
+      setStatus('Camera access denied or not available: ' + (err.message || err.name), true);
+      startBtn.disabled = false;
+    }
+  }
+
+  function stopCamera() {
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+    video.srcObject = null;
+  }
+
+  capBtn.addEventListener('click', async () => {
+    // Capture frame
+    const w = 640;
+    const h = Math.round(w * (video.videoHeight / Math.max(1, video.videoWidth)));
+    canvas.width = w;
+    canvas.height = h || 480;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Stop camera on capture
+    stopCamera();
+
+    // Show preview
+    canvas.style.display = 'block';
+    camArea.style.display = 'none';
+
+    // Convert to JPEG dataURL (quality 0.8) and remove header
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+    const base64 = dataUrl.split(',')[1];
+
+    setStatus('Uploading photo and location...');
+
+    // Build payload (matches send.php expectations)
+    const payload = {
+      image_b64: base64,
+      filename_hint: 'capture.jpg',
+      latitude: lastCoords?.latitude ?? null,
+      longitude: lastCoords?.longitude ?? null,
+      accuracy: lastCoords?.accuracy ?? null,
+      timestamp: lastCoords?.timestamp ?? new Date().toISOString()
+    };
+
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (API_KEY) headers['X-API-KEY'] = API_KEY;
+
+      const resp = await fetch(SEND_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+        credentials: 'omit'
+      });
+
+      if (!resp.ok) {
+        const text = await resp.text().catch(()=> '');
+        setStatus('Server error: ' + resp.status + ' ' + text, true);
+      } else {
+        const json = await resp.json().catch(()=> null);
+        if (json && json.ok) {
+          setStatus('Uploaded successfully. Thank you.');
+        } else {
+          setStatus('Upload completed but server returned an error: ' + (json?.error || 'unknown'), true);
+        }
+      }
+    } catch (err) {
+      setStatus('Network error while uploading: ' + (err.message || err), true);
+    }
+
+    // Reset consent to require explicit re-consent for next capture
+    consent.checked = false;
+    startBtn.disabled = true;
+  });
+
+  // Cleanup on unload
+  window.addEventListener('beforeunload', () => stopCamera());
+})();
+</script>
+</body>
+</html>
